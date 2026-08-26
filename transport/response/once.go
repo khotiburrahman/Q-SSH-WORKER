@@ -2,6 +2,7 @@ package response
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"strconv"
@@ -103,26 +104,65 @@ func Once(cfg *config.Config, conn net.Conn, secondPart string) (net.Conn, error
 			debug.Println("[SWEEPING] Menyapu sisa bodi kotor untuk mencari gerbang biner SSH...")
 		}
 
+		var collectedBody strings.Builder
+
 		for {
 			peekLine, err := reader.ReadString('\n')
 			if err != nil {
 				_ = conn.SetReadDeadline(time.Time{})
-				if reader.Buffered() > 0 {
-					stream := io.MultiReader(reader, conn)
-					return internal.NewBufferedConn(conn, stream), nil
+
+				fullBody := strings.ToLower(collectedBody.String())
+				
+				// 1. Cek mutlak jika ada indikasi akun mati/expired di dalam bodi respon
+				if strings.Contains(fullBody, "expired") || strings.Contains(fullBody, "reject") || strings.Contains(fullBody, "auth") {
+					debug.EvaluateRejectResponse(statusCode, status, headers, conn, reader)
+					return conn, errors.New("AUTH_FAILED")
 				}
+
+				// 2. Jika akun aktif tapi tetap EOF karena Cloudflare nge-drop koneksi (seperti log kamu)
+				if err == io.EOF {
+					// Jika di dalam bodi chunked Cloudflare tidak ada info expired, artinya bug host/payload-mu yang mental
+					if debug.Enable {
+						debug.Println("[TUNNEL TRICK] Koneksi diputus Cloudflare (EOF). Mencoba meneruskan reader...")
+					}
+					
+					// Paksa bungkus sisa buffer yang ada, jangan langsung matikan worker
+					if reader.Buffered() > 0 {
+						stream := io.MultiReader(reader, conn)
+						return internal.NewBufferedConn(conn, stream), nil
+					}
+					
+					// Jika buffer kosong total dan tidak ada indikasi expired, return eror murni agar master tahu ini masalah jaringan/payload
+					return nil, err
+				}
+				
 				return nil, err
 			}
 
+			collectedBody.WriteString(peekLine)
+
+			// Jika banner SSH ditemukan di sela-sela pembersihan bodi
 			if strings.HasPrefix(peekLine, "SSH-") {
 				_ = conn.SetReadDeadline(time.Time{})
-				
+
 				debug.SSHBanner(peekLine)
 
 				stream := io.MultiReader(strings.NewReader(peekLine), reader, conn)
 				return internal.NewBufferedConn(conn, stream), nil
 			}
 		}
+	}
+
+	// ======================================================================
+	// 🛑 SKENARIO C: RESPONS ERROR PENOLAKAN DARI SERVER (400, 403, 503, dll)
+	// ======================================================================
+	if statusCode >= 400 && statusCode < 600 {
+
+		// 🟢 Panggil fungsi terpusat di package debug. Bersih dan tidak berceceran!
+		debug.EvaluateRejectResponse(statusCode, status, headers, conn, reader)
+
+		// Kembalikan objek koneksi dan error otentikasi murni ke Master Manager
+		return conn, errors.New("AUTH_FAILED")
 	}
 
 	if reader.Buffered() > 0 {

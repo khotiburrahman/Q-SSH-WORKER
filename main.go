@@ -150,13 +150,26 @@ func main() {
 				cmd := exec.Command(binPath, args...)
 				cmd.Env = append(os.Environ(), fmt.Sprintf("QTUN_TARGET_PORT=%d", port))
 				
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
+                cmd.Stdout = os.Stdout
+                cmd.Stderr = os.Stderr
 
-				_ = cmd.Run()
+                // 🟢 Tangkap error hasil run proses anak
+                err := cmd.Run()
+                if err != nil {
+                    // Cek apakah anak sengaja keluar dengan kode khusus (ExitError)
+                    if exitError, ok := err.(*exec.ExitError); ok {
+                        // Ambil status exit code biner anak
+                        if status, ok := exitError.Sys().(interface{ ExitStatus() int }); ok {
+                            if status.ExitStatus() == 5 {
+                                fmt.Printf("\n❌ [MASTER] Menangkap kode 5. Menghentikan seluruh Master Manager karena kredensial expired/salah!\n")
+                                os.Exit(1) // Matikan Master secara total
+                            }
+                        }
+                    }
+                }
 
-				fmt.Printf("⚠️ Worker port %d terputus gantung (EOF/Mati)! Membangunkan ulang dalam 3 detik...\n", port)
-				time.Sleep(3 * time.Second) // Jeda napas anti-looper sebelum spawn ulang
+                fmt.Printf("⚠️ Worker port %d terputus gantung (EOF/Mati)! Membangunkan ulang dalam 3 detik...\n", port)
+                time.Sleep(3 * time.Second) // Jeda napas anti-looper sebelum spawn ulang
 			}
 		}(targetPort)
 
