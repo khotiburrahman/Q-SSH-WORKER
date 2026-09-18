@@ -13,14 +13,24 @@ type relayResult struct {
 	err       error
 }
 
-// Relay melakukan penyalinan data timbal balik
-// secara bidirectional.
+// Relay melakukan relay data dua arah antara client SOCKS
+// dan SSH channel.
+//
+// Lifecycle:
+//
+//	client <-> SSH channel
+//	    │
+//	    ├── CLIENT_TO_REMOTE
+//	    │
+//	    └── REMOTE_TO_CLIENT
+//
+// Jika salah satu arah selesai/error, kedua koneksi ditutup
+// agar arah lainnya tidak menggantung.
 func Relay(
 	client net.Conn,
 	remote net.Conn,
 	connectionID string,
 ) {
-
 	resultChan := make(chan relayResult, 2)
 
 	fmt.Printf(
@@ -32,14 +42,16 @@ func Relay(
 
 	// ==============================================================
 	// ARAH 1:
-	// HP / CLIENT → SSH → VPS → INTERNET
+	// CLIENT → SSH → VPS → INTERNET
 	// ==============================================================
 
 	go func() {
-		n, err := io.Copy(
-			remote,
-			client,
+		fmt.Printf(
+			"[%s] RELAY COPY START direction=CLIENT_TO_REMOTE\n",
+			connectionID,
 		)
+
+		n, err := io.Copy(remote, client)
 
 		resultChan <- relayResult{
 			direction: "CLIENT_TO_REMOTE",
@@ -50,14 +62,16 @@ func Relay(
 
 	// ==============================================================
 	// ARAH 2:
-	// INTERNET → VPS → SSH → HP / CLIENT
+	// INTERNET → VPS → SSH → CLIENT
 	// ==============================================================
 
 	go func() {
-		n, err := io.Copy(
-			client,
-			remote,
+		fmt.Printf(
+			"[%s] RELAY COPY START direction=REMOTE_TO_CLIENT\n",
+			connectionID,
 		)
+
+		n, err := io.Copy(client, remote)
 
 		resultChan <- relayResult{
 			direction: "REMOTE_TO_CLIENT",
@@ -67,7 +81,7 @@ func Relay(
 	}()
 
 	// ==============================================================
-	// TUNGGU ARAH PERTAMA SELESAI
+	// TUNGGU ARAH PERTAMA
 	// ==============================================================
 
 	first := <-resultChan
@@ -81,12 +95,9 @@ func Relay(
 	)
 
 	// ==============================================================
-	// PENTING:
+	// TUTUP KEDUA SISI
 	//
-	// Jika salah satu arah selesai, paksa kedua socket ditutup.
-	//
-	// Ini memastikan goroutine io.Copy arah lainnya
-	// tidak menggantung selamanya.
+	// Ini memaksa io.Copy arah kedua keluar dari blocking read/write.
 	// ==============================================================
 
 	fmt.Printf(
@@ -98,7 +109,7 @@ func Relay(
 	_ = remote.Close()
 
 	// ==============================================================
-	// TUNGGU ARAH KEDUA BENAR-BENAR SELESAI
+	// TUNGGU ARAH KEDUA
 	// ==============================================================
 
 	second := <-resultChan
