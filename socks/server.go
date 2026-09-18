@@ -16,11 +16,11 @@ import (
 // ConnectionRegistry menyimpan seluruh koneksi SOCKS aktif
 // milik satu worker.
 type ConnectionRegistry struct {
-	mu        sync.Mutex
-	workerID  string
-	pid       int
-	counter   uint64
-	conns     map[string]net.Conn
+	mu       sync.Mutex
+	workerID string
+	pid      int
+	counter  uint64
+	conns    map[string]net.Conn
 }
 
 // NewConnectionRegistry membuat registry baru untuk satu worker.
@@ -53,7 +53,10 @@ func (r *ConnectionRegistry) NewConnectionID() string {
 }
 
 // Add mendaftarkan koneksi aktif.
-func (r *ConnectionRegistry) Add(id string, conn net.Conn) {
+func (r *ConnectionRegistry) Add(
+	id string,
+	conn net.Conn,
+) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -81,15 +84,9 @@ func (r *ConnectionRegistry) Remove(id string) {
 }
 
 // CloseAll menutup seluruh koneksi aktif.
-//
-// Fungsi ini dipanggil ketika worker akan shutdown.
 func (r *ConnectionRegistry) CloseAll(reason string) {
 	r.mu.Lock()
 
-	// Salin daftar koneksi terlebih dahulu.
-	// Jangan melakukan Close sambil mutex masih menjadi
-	// satu-satunya sumber akses jika Close memicu callback
-	// lain yang mencoba Remove().
 	connections := make(map[string]net.Conn, len(r.conns))
 
 	for id, conn := range r.conns {
@@ -136,7 +133,11 @@ func ListenAndServe(
 		strconv.Itoa(cfg.Listen.Port),
 	)
 
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, err := net.Listen(
+		"tcp",
+		listenAddr,
+	)
+
 	if err != nil {
 		return err
 	}
@@ -156,12 +157,17 @@ func ListenAndServe(
 		clientConn, err := listener.Accept()
 
 		if err != nil {
-			continue
+			// Jika listener benar-benar ditutup/error fatal,
+			// jangan melakukan loop tanpa akhir.
+			return fmt.Errorf(
+				"accept failed: %w",
+				err,
+			)
 		}
 
-		// ==============================================================
-		// CONNECTION ID DIBUAT TEPAT SAAT ACCEPT BERHASIL
-		// ==============================================================
+		// ==========================================================
+		// CONNECTION ID DIBUAT TEPAT SETELAH ACCEPT
+		// ==========================================================
 
 		connectionID := registry.NewConnectionID()
 
