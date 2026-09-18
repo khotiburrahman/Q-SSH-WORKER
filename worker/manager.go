@@ -19,7 +19,6 @@ import (
 
 // StartWorker mengelola satu worker SSH.
 func StartWorker(cfg *config.Config) error {
-
 	reconnectPolicy := NewReconnectPolicy(
 		2*time.Second,
 		30*time.Second,
@@ -269,34 +268,134 @@ func StartWorker(cfg *config.Config) error {
 		context.Background(),
 	)
 
-	healthFailChan := make(chan bool, 1)
+	defer cancelHealth()
+
+	healthResultChan := make(chan HealthResult, 4)
 
 	go MonitorHealth(
 		healthCtx,
 		client,
-		healthFailChan,
+		healthResultChan,
 	)
 
 	// ==============================================================
-	// WAIT FOR FAILURE
+	// TRAFFIC MONITOR
+	// ==============================================================
+
+	statsCtx, cancelStats := context.WithCancel(
+		context.Background(),
+	)
+
+	defer cancelStats()
+
+	// Snapshot pertama.
+	previousStats := workerStats.Snapshot()
+
+	go func() {
+		ticker := time.NewTicker(
+			10 * time.Second,
+		)
+
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-statsCtx.Done():
+				return
+
+			case <-ticker.C:
+				rate, current := workerStats.Rate(
+					previousStats,
+				)
+
+				previousStats = current
+
+				active := connectionRegistry.ActiveCount()
+
+				fmt.Printf(
+					"[WORKER %s] STATS active=%d RX=%.2f KB/s TX=%.2f KB/s\n",
+					workerID,
+					active,
+					rate.RxBytesPerSec/1024,
+					rate.TxBytesPerSec/1024,
+				)
+			}
+		}
+	}()
+
+	// ==============================================================
+	// WAIT FOR FAILURE / HEALTH STATE
 	// ==============================================================
 
 	var fatalErr error
 
-	select {
+	for {
+		select {
 
-	case err := <-socksErrChan:
+		case err := <-socksErrChan:
 
-		fatalErr = fmt.Errorf(
-			"socks5 server stopped: %v",
-			err,
-		)
+			fatalErr = fmt.Errorf(
+				"socks5 server stopped: %v",
+				err,
+			)
 
-	case <-healthFailChan:
+			goto shutdown
 
-		fatalErr = fmt.Errorf(
-			"koneksi internet mati gantung dideteksi oleh health monitor",
-		)
+		case health := <-healthResultChan:
+
+			switch health.Status {
+
+			case HealthHealthy:
+
+				fmt.Printf(
+					"[WORKER %s] HEALTHY latency=%v\n",
+					workerID,
+					health.Latency.Round(time.Millisecond),
+				)
+
+			case HealthDegraded:
+
+				if health.Err != nil {
+					fmt.Printf(
+						"[WORKER %s] DEGRADED latency=%v failures=%d err=%v\n",
+						workerID,
+						health.Latency.Round(time.Millisecond),
+						health.Failures,
+						health.Err,
+					)
+				} else {
+					fmt.Printf(
+						"[WORKER %s] DEGRADED latency=%v active=%d\n",
+						workerID,
+						health.Latency.Round(time.Millisecond),
+						connectionRegistry.ActiveCount(),
+					)
+				}
+
+				// PENTING:
+				//
+				// Jangan CloseAll().
+				// Jangan tutup SSH.
+				// Koneksi yang sedang berjalan dibiarkan.
+				//
+				// Pada tahap berikutnya status DEGRADED
+				// dapat dipakai untuk mencegah koneksi BARU
+				// masuk ke worker ini.
+
+				continue
+
+			case HealthDead:
+
+				fatalErr = fmt.Errorf(
+					"koneksi SSH mati: failures=%d latency=%v err=%v",
+					health.Failures,
+					health.Latency.Round(time.Millisecond),
+					health.Err,
+				)
+
+				goto shutdown
+			}
+		}
 	}
 
 	// ==============================================================
@@ -305,11 +404,14 @@ func StartWorker(cfg *config.Config) error {
 	// Urutan:
 	//
 	// 1. Stop health monitor
-	// 2. Close seluruh koneksi HP
-	// 3. Close SSH client
-	// 4. Close transport
-	// 5. Return ke master
+	// 2. Stop stats monitor
+	// 3. Close seluruh koneksi HP
+	// 4. Close SSH client
+	// 5. Close transport
+	// 6. Return ke master
 	// ==============================================================
+
+shutdown:
 
 	fmt.Printf(
 		"[WORKER %s] Shutdown initiated: %v\n",
@@ -318,6 +420,7 @@ func StartWorker(cfg *config.Config) error {
 	)
 
 	cancelHealth()
+	cancelStats()
 
 	// ==============================================================
 	// CLOSE SEMUA KONEKSI SOCKS
