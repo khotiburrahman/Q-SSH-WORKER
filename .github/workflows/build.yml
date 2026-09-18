@@ -6,7 +6,7 @@ on:
       version:
         description: "Bakal versi kompilasi (contoh: v1.0.0)"
         required: true
-        default: "v1.0.0"
+        default: "v1.0.3"
 
 jobs:
   build:
