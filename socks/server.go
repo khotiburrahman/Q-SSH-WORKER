@@ -13,8 +13,6 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
-// ConnectionRegistry menyimpan seluruh koneksi SOCKS aktif
-// milik satu worker.
 type ConnectionRegistry struct {
 	mu       sync.Mutex
 	workerID string
@@ -23,7 +21,6 @@ type ConnectionRegistry struct {
 	conns    map[string]net.Conn
 }
 
-// NewConnectionRegistry membuat registry baru untuk satu worker.
 func NewConnectionRegistry(workerID string) *ConnectionRegistry {
 	return &ConnectionRegistry{
 		workerID: workerID,
@@ -32,88 +29,46 @@ func NewConnectionRegistry(workerID string) *ConnectionRegistry {
 	}
 }
 
-// NewConnectionID membuat ID unik untuk setiap koneksi.
-//
-// Format:
-//
-//	W<worker/port>-P<pid>-C<counter>
-//
-// Contoh:
-//
-//	W1081-P4217-C000001
 func (r *ConnectionRegistry) NewConnectionID() string {
 	counter := atomic.AddUint64(&r.counter, 1)
-
-	return fmt.Sprintf(
-		"W%s-P%d-C%06d",
-		r.workerID,
-		r.pid,
-		counter,
-	)
+	return fmt.Sprintf("W%s-P%d-C%06d", r.workerID, r.pid, counter)
 }
 
-// Add mendaftarkan koneksi aktif.
-func (r *ConnectionRegistry) Add(
-	id string,
-	conn net.Conn,
-) {
+func (r *ConnectionRegistry) Add(id string, conn net.Conn) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.conns[id] = conn
-
-	fmt.Printf(
-		"[%s] REGISTRY ADD active=%d\n",
-		id,
-		len(r.conns),
-	)
+	logger.Debug("[%s] REGISTRY ADD active=%d", id, len(r.conns))
 }
 
-// Remove menghapus koneksi dari registry.
 func (r *ConnectionRegistry) Remove(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	delete(r.conns, id)
-
-	fmt.Printf(
-		"[%s] REGISTRY REMOVE active=%d\n",
-		id,
-		len(r.conns),
-	)
+	logger.Debug("[%s] REGISTRY REMOVE active=%d", id, len(r.conns))
 }
 
-// CloseAll menutup seluruh koneksi aktif.
 func (r *ConnectionRegistry) CloseAll(reason string) {
 	r.mu.Lock()
 
 	connections := make(map[string]net.Conn, len(r.conns))
-
 	for id, conn := range r.conns {
 		connections[id] = conn
 	}
 
 	r.mu.Unlock()
 
-	fmt.Printf(
-		"[WORKER %s] Closing %d active SOCKS connections, reason=%s\n",
-		r.workerID,
-		len(connections),
-		reason,
-	)
+	logger.Info("[WORKER %s] Closing %d active SOCKS connections, reason=%s",
+		r.workerID, len(connections), reason)
 
 	for id, conn := range connections {
-		fmt.Printf(
-			"[%s] CLIENT CLOSE reason=%s\n",
-			id,
-			reason,
-		)
-
+		logger.Debug("[%s] CLIENT CLOSE reason=%s", id, reason)
 		_ = conn.Close()
 	}
 }
 
-// ActiveCount mengembalikan jumlah koneksi aktif.
 func (r *ConnectionRegistry) ActiveCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -121,73 +76,39 @@ func (r *ConnectionRegistry) ActiveCount() int {
 	return len(r.conns)
 }
 
-// ListenAndServe menjalankan SOCKS5 server.
 func ListenAndServe(
 	cfg *config.Config,
 	sshClient *gossh.Client,
 	registry *ConnectionRegistry,
 ) error {
-
 	listenAddr := net.JoinHostPort(
 		cfg.Listen.Host,
 		strconv.Itoa(cfg.Listen.Port),
 	)
 
-	listener, err := net.Listen(
-		"tcp",
-		listenAddr,
-	)
-
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return err
 	}
-
 	defer listener.Close()
 
 	logger.SOCKS5Listening(listenAddr)
 
-	fmt.Printf(
-		"[SOCKS] Listening on %s PID=%d worker=%s\n",
-		listenAddr,
-		os.Getpid(),
-		registry.workerID,
-	)
+	logger.Info("[SOCKS] Listening on %s PID=%d worker=%s",
+		listenAddr, os.Getpid(), registry.workerID)
 
 	for {
 		clientConn, err := listener.Accept()
-
 		if err != nil {
-			// Jika listener benar-benar ditutup/error fatal,
-			// jangan melakukan loop tanpa akhir.
-			return fmt.Errorf(
-				"accept failed: %w",
-				err,
-			)
+			return fmt.Errorf("accept failed: %w", err)
 		}
 
-		// ==========================================================
-		// CONNECTION ID DIBUAT TEPAT SETELAH ACCEPT
-		// ==========================================================
-
 		connectionID := registry.NewConnectionID()
+		registry.Add(connectionID, clientConn)
 
-		registry.Add(
-			connectionID,
-			clientConn,
-		)
+		logger.Debug("[%s] ACCEPT remote=%s local=%s",
+			connectionID, clientConn.RemoteAddr(), clientConn.LocalAddr())
 
-		fmt.Printf(
-			"[%s] ACCEPT remote=%s local=%s\n",
-			connectionID,
-			clientConn.RemoteAddr(),
-			clientConn.LocalAddr(),
-		)
-
-		go HandleRequest(
-			clientConn,
-			sshClient,
-			connectionID,
-			registry,
-		)
+		go HandleRequest(clientConn, sshClient, connectionID, registry)
 	}
 }

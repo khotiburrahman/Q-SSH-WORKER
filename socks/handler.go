@@ -7,11 +7,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/QcomWrt/Q-SSH-WORKER/logger"
 	gossh "golang.org/x/crypto/ssh"
 )
 
-// HandleRequest memproses handshake SOCKS5
-// dan menghubungkannya ke terowongan SSH.
 func HandleRequest(
 	clientConn net.Conn,
 	sshClient *gossh.Client,
@@ -19,130 +18,57 @@ func HandleRequest(
 	registry *ConnectionRegistry,
 ) {
 	defer func() {
-		fmt.Printf(
-			"[%s] CLIENT CLOSE reason=handler_end\n",
-			connectionID,
-		)
-
+		logger.Debug("[%s] CLIENT CLOSE reason=handler_end", connectionID)
 		_ = clientConn.Close()
-
 		registry.Remove(connectionID)
-
-		fmt.Printf(
-			"[%s] REQUEST END\n",
-			connectionID,
-		)
+		logger.Debug("[%s] REQUEST END", connectionID)
 	}()
 
-	fmt.Printf(
-		"[%s] REQUEST START remote=%s\n",
-		connectionID,
-		clientConn.RemoteAddr(),
-	)
-
-	// ==============================================================
-	// DEADLINE KHUSUS SOCKS HANDSHAKE
-	//
-	// Hanya berlaku sebelum koneksi masuk ke relay.
-	// Setelah SSH channel berhasil dan response SOCKS dikirim,
-	// deadline dihapus.
-	// ==============================================================
+	logger.Debug("[%s] REQUEST START remote=%s", connectionID, clientConn.RemoteAddr())
 
 	const handshakeTimeout = 15 * time.Second
 
-	if err := clientConn.SetDeadline(
-		time.Now().Add(handshakeTimeout),
-	); err != nil {
-		fmt.Printf(
-			"[%s] SOCKS DEADLINE SET ERROR: %v\n",
-			connectionID,
-			err,
-		)
+	if err := clientConn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		logger.Debug("[%s] SOCKS DEADLINE SET ERROR: %v", connectionID, err)
 	}
 
 	buf := make([]byte, 256)
 
-	// ==============================================================
 	// TAHAP 1: NEGOSIASI AUTENTIKASI
-	// ==============================================================
-
 	if _, err := io.ReadFull(clientConn, buf[:2]); err != nil {
-		fmt.Printf(
-			"[%s] SOCKS AUTH READ ERROR: %v\n",
-			connectionID,
-			err,
-		)
-
+		logger.Debug("[%s] SOCKS AUTH READ ERROR: %v", connectionID, err)
 		return
 	}
 
 	if buf[0] != 0x05 {
-		fmt.Printf(
-			"[%s] SOCKS INVALID VERSION=%d\n",
-			connectionID,
-			buf[0],
-		)
-
+		logger.Debug("[%s] SOCKS INVALID VERSION=%d", connectionID, buf[0])
 		return
 	}
 
 	numMethods := int(buf[1])
-
 	if numMethods == 0 || numMethods > 255 {
-		fmt.Printf(
-			"[%s] SOCKS INVALID METHODS=%d\n",
-			connectionID,
-			numMethods,
-		)
-
+		logger.Debug("[%s] SOCKS INVALID METHODS=%d", connectionID, numMethods)
 		return
 	}
 
 	if _, err := io.ReadFull(clientConn, buf[:numMethods]); err != nil {
-		fmt.Printf(
-			"[%s] SOCKS METHODS READ ERROR: %v\n",
-			connectionID,
-			err,
-		)
-
+		logger.Debug("[%s] SOCKS METHODS READ ERROR: %v", connectionID, err)
 		return
 	}
 
-	// NO AUTHENTICATION REQUIRED
-	if _, err := clientConn.Write([]byte{
-		0x05,
-		0x00,
-	}); err != nil {
-		fmt.Printf(
-			"[%s] SOCKS AUTH RESPONSE ERROR: %v\n",
-			connectionID,
-			err,
-		)
-
+	if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
+		logger.Debug("[%s] SOCKS AUTH RESPONSE ERROR: %v", connectionID, err)
 		return
 	}
 
-	// ==============================================================
-	// TAHAP 2: MEMBACA REQUEST PERINTAH
-	// ==============================================================
-
+	// TAHAP 2: MEMBACA REQUEST
 	if _, err := io.ReadFull(clientConn, buf[:4]); err != nil {
-		fmt.Printf(
-			"[%s] SOCKS REQUEST HEADER ERROR: %v\n",
-			connectionID,
-			err,
-		)
-
+		logger.Debug("[%s] SOCKS REQUEST HEADER ERROR: %v", connectionID, err)
 		return
 	}
 
 	if buf[0] != 0x05 {
-		fmt.Printf(
-			"[%s] SOCKS REQUEST INVALID VERSION=%d\n",
-			connectionID,
-			buf[0],
-		)
-
+		logger.Debug("[%s] SOCKS REQUEST INVALID VERSION=%d", connectionID, buf[0])
 		return
 	}
 
@@ -150,251 +76,86 @@ func HandleRequest(
 	atyp := buf[3]
 
 	if cmd != 0x01 {
-		fmt.Printf(
-			"[%s] SOCKS UNSUPPORTED CMD=0x%02x\n",
-			connectionID,
-			cmd,
-		)
-
-		_, _ = clientConn.Write([]byte{
-			0x05,
-			0x07,
-			0x00,
-			0x01,
-			0,
-			0,
-			0,
-			0,
-			0,
-			0,
-		})
-
+		logger.Debug("[%s] SOCKS UNSUPPORTED CMD=0x%02x", connectionID, cmd)
+		_, _ = clientConn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 
 	var targetHost string
 
 	switch atyp {
-
 	case 0x01:
-		// ==========================================================
-		// IPv4
-		// ==========================================================
-
 		if _, err := io.ReadFull(clientConn, buf[:4]); err != nil {
-			fmt.Printf(
-				"[%s] SOCKS IPV4 READ ERROR: %v\n",
-				connectionID,
-				err,
-			)
-
+			logger.Debug("[%s] SOCKS IPV4 READ ERROR: %v", connectionID, err)
 			return
 		}
-
 		targetHost = net.IP(buf[:4]).String()
 
 	case 0x03:
-		// ==========================================================
-		// DOMAIN
-		// ==========================================================
-
 		if _, err := io.ReadFull(clientConn, buf[:1]); err != nil {
-			fmt.Printf(
-				"[%s] SOCKS DOMAIN LENGTH ERROR: %v\n",
-				connectionID,
-				err,
-			)
-
+			logger.Debug("[%s] SOCKS DOMAIN LENGTH ERROR: %v", connectionID, err)
 			return
 		}
 
 		domainLen := int(buf[0])
-
 		if domainLen == 0 || domainLen > 255 {
-			fmt.Printf(
-				"[%s] SOCKS INVALID DOMAIN LENGTH=%d\n",
-				connectionID,
-				domainLen,
-			)
-
+			logger.Debug("[%s] SOCKS INVALID DOMAIN LENGTH=%d", connectionID, domainLen)
 			return
 		}
 
-		if _, err := io.ReadFull(
-			clientConn,
-			buf[:domainLen],
-		); err != nil {
-			fmt.Printf(
-				"[%s] SOCKS DOMAIN READ ERROR: %v\n",
-				connectionID,
-				err,
-			)
-
+		if _, err := io.ReadFull(clientConn, buf[:domainLen]); err != nil {
+			logger.Debug("[%s] SOCKS DOMAIN READ ERROR: %v", connectionID, err)
 			return
 		}
-
 		targetHost = string(buf[:domainLen])
 
 	default:
-		fmt.Printf(
-			"[%s] SOCKS UNSUPPORTED ADDRESS TYPE=0x%02x\n",
-			connectionID,
-			atyp,
-		)
-
-		_, _ = clientConn.Write([]byte{
-			0x05,
-			0x08,
-			0x00,
-			0x01,
-			0,
-			0,
-			0,
-			0,
-			0,
-			0,
-		})
-
+		logger.Debug("[%s] SOCKS UNSUPPORTED ADDRESS TYPE=0x%02x", connectionID, atyp)
+		_, _ = clientConn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 
-	// ==============================================================
-	// MEMBACA PORT
-	// ==============================================================
-
 	if _, err := io.ReadFull(clientConn, buf[:2]); err != nil {
-		fmt.Printf(
-			"[%s] SOCKS PORT READ ERROR: %v\n",
-			connectionID,
-			err,
-		)
-
+		logger.Debug("[%s] SOCKS PORT READ ERROR: %v", connectionID, err)
 		return
 	}
 
 	targetPort := int(buf[0])<<8 | int(buf[1])
+	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 
-	targetAddr := net.JoinHostPort(
-		targetHost,
-		strconv.Itoa(targetPort),
-	)
+	logger.Debug("[%s] TARGET %s", connectionID, targetAddr)
 
-	fmt.Printf(
-		"[%s] TARGET %s\n",
-		connectionID,
-		targetAddr,
-	)
+	logger.Debug("[%s] SSH CHANNEL OPEN", connectionID)
 
-	// ==============================================================
-	// TAHAP 3: DIAL VIA SSH
-	// ==============================================================
-
-	fmt.Printf(
-		"[%s] SSH CHANNEL OPEN\n",
-		connectionID,
-	)
-
-	sshConn, err := sshClient.Dial(
-		"tcp",
-		targetAddr,
-	)
-
+	sshConn, err := sshClient.Dial("tcp", targetAddr)
 	if err != nil {
-		fmt.Printf(
-			"[%s] SSH CHANNEL ERROR target=%s err=%v\n",
-			connectionID,
-			targetAddr,
-			err,
-		)
-
-		_, _ = clientConn.Write([]byte{
-			0x05,
-			0x03,
-			0x00,
-			0x01,
-			0,
-			0,
-			0,
-			0,
-			0,
-			0,
-		})
-
+		logger.Debug("[%s] SSH CHANNEL ERROR target=%s err=%v", connectionID, targetAddr, err)
+		_, _ = clientConn.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 
 	defer func() {
-		fmt.Printf(
-			"[%s] SSH CHANNEL CLOSE\n",
-			connectionID,
-		)
-
+		logger.Debug("[%s] SSH CHANNEL CLOSE", connectionID)
 		_ = sshConn.Close()
 	}()
 
-	fmt.Printf(
-		"[%s] SSH CHANNEL OPENED target=%s\n",
-		connectionID,
-		targetAddr,
-	)
-
-	// ==============================================================
-	// PENTING:
-	// Hapus deadline handshake.
-	//
-	// Setelah titik ini koneksi boleh idle selama apa pun.
-	// ==============================================================
+	logger.Debug("[%s] SSH CHANNEL OPENED target=%s", connectionID, targetAddr)
 
 	if err := clientConn.SetDeadline(time.Time{}); err != nil {
-		fmt.Printf(
-			"[%s] SOCKS DEADLINE CLEAR ERROR: %v\n",
-			connectionID,
-			err,
-		)
+		logger.Debug("[%s] SOCKS DEADLINE CLEAR ERROR: %v", connectionID, err)
 	}
 
-	// ==============================================================
-	// KIRIM RESPONSE SOCKS SUCCESS
-	// ==============================================================
-
-	if _, err := clientConn.Write([]byte{
-		0x05,
-		0x00,
-		0x00,
-		0x01,
-		0,
-		0,
-		0,
-		0,
-		0,
-		0,
-	}); err != nil {
-		fmt.Printf(
-			"[%s] SOCKS SUCCESS RESPONSE ERROR: %v\n",
-			connectionID,
-			err,
-		)
-
+	if _, err := clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		logger.Debug("[%s] SOCKS SUCCESS RESPONSE ERROR: %v", connectionID, err)
 		return
 	}
 
-	// ==============================================================
-	// TAHAP 4: RELAY
-	// ==============================================================
+	logger.Debug("[%s] RELAY START", connectionID)
 
-	fmt.Printf(
-		"[%s] RELAY START\n",
-		connectionID,
-	)
+	Relay(clientConn, sshConn, connectionID)
 
-	Relay(
-		clientConn,
-		sshConn,
-		connectionID,
-	)
-
-	fmt.Printf(
-		"[%s] RELAY RETURNED\n",
-		connectionID,
-	)
+	logger.Debug("[%s] RELAY RETURNED", connectionID)
 }
+
+// dummy agar fmt tetap dipakai kalau ada error path
+var _ = fmt.Sprintf
