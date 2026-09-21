@@ -32,6 +32,7 @@ func main() {
 		dialPath         string
 		checkPath        string
 		showEndpointPath string
+		logPath          string
 		showVersion      bool
 		forceDebug       bool
 		isChild          bool
@@ -40,6 +41,7 @@ func main() {
 	flag.StringVar(&dialPath, "dial", "", "Jalur ke file konfigurasi JSON untuk terhubung ke SSH")
 	flag.StringVar(&checkPath, "check", "", "Hanya memvalidasi sintaks file konfigurasi JSON")
 	flag.StringVar(&showEndpointPath, "show-endpoint", "", "Ambil detail IP Server VPS untuk keperluan routing bypass")
+	flag.StringVar(&logPath, "log", "", "File log tujuan. Jika kosong, log ke stdout")
 	flag.BoolVar(&showVersion, "version", false, "Menampilkan informasi versi biner Q-SSH-WORKER")
 	flag.BoolVar(&forceDebug, "debug", false, "Memaksa mengaktifkan mode debug secara manual via CLI")
 	flag.BoolVar(&isChild, "child", false, "Flag internal penanda proses child-worker")
@@ -101,7 +103,7 @@ func main() {
 	// 4. HANDLER: --dial
 	if dialPath == "" {
 		fmt.Println("Gunakan perintah:")
-		fmt.Println("  ./Q-SSH-WORKER --dial <file.json>")
+		fmt.Println("  ./Q-SSH-WORKER --dial <file.json> [--log <file.log>]")
 		fmt.Println("  ./Q-SSH-WORKER --show-endpoint <file.json>")
 		os.Exit(1)
 	}
@@ -112,15 +114,46 @@ func main() {
 		os.Exit(1)
 	}
 
+	// ======================================================================
+	// REDIRECT LOG KE FILE
+	//
+	// Dilakukan SETELAH config berhasil dimuat, supaya error config tetap
+	// tampil di terminal (bukan tersembunyi di file log).
+	// ======================================================================
+	if logPath != "" {
+		if err := logger.RedirectStdio(logPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Gagal membuka log file %s: %v\n", logPath, err)
+			os.Exit(1)
+		}
+	}
+
 	if forceDebug {
 		debug.Enable = true
 		logger.DebugEnable = true
 	}
 
 	// ======================================================================
+	// SIGUSR1 HANDLER UNTUK LOGROTATE
+	//
+	// Logrotate akan rename file log, lalu kirim SIGUSR1 ke proses.
+	// Handler ini akan reopen file baru dengan path yang sama.
+	// ======================================================================
+	go func() {
+		sigusr := make(chan os.Signal, 1)
+		signal.Notify(sigusr, syscall.SIGUSR1)
+
+		for range sigusr {
+			if err := logger.Reopen(); err != nil {
+				logger.Errorf("[LOG] gagal reopen log: %v", err)
+			} else {
+				logger.Info("[LOG] log file dibuka ulang setelah rotate")
+			}
+		}
+	}()
+
+	// ======================================================================
 	// JALUR A: CHILD ATAU SINGLE WORKER
 	// ======================================================================
-
 	if isChild || !cfg.Worker.Enable {
 		err := worker.StartWorker(ctx, cfg)
 
@@ -145,7 +178,6 @@ func main() {
 	// ======================================================================
 	// JALUR B: MASTER MANAGER
 	// ======================================================================
-
 	fmt.Printf("👑 Q-SSH-WORKER bertindak sebagai Master Manager (Menjaga %d Workers)\n", cfg.Worker.Workers)
 
 	binPath, err := os.Executable()
@@ -173,10 +205,13 @@ func main() {
 				if forceDebug {
 					args = append(args, "--debug")
 				}
+				if logPath != "" {
+					args = append(args, "--log", logPath)
+				}
 
 				cmd := exec.CommandContext(ctx, binPath, args...)
 
-				// Kirim SIGTERM dulu, bukan SIGKILL, supaya child bisa cleanup.
+				// Kirim SIGTERM dulu agar child bisa cleanup.
 				cmd.Cancel = func() error {
 					if cmd.Process == nil {
 						return nil
@@ -190,8 +225,9 @@ func main() {
 					fmt.Sprintf("QTUN_TARGET_PORT=%d", port),
 				)
 
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
+				// Stdout dan Stderr TIDAK diset.
+				// Child akan menangani log sendiri via flag --log yang diwariskan
+				// dari argumen di atas. Ini mencegah tumpang tindih FD.
 
 				err := cmd.Run()
 
@@ -229,7 +265,6 @@ func main() {
 			}
 		}(targetPort)
 
-		// Jeda antar spawn awal
 		select {
 		case <-time.After(3 * time.Second):
 		case <-ctx.Done():
