@@ -3,7 +3,8 @@ package logger
 import (
 	"os"
 	"sync"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -18,6 +19,9 @@ var (
 //
 // File dibuka dengan O_APPEND, jadi aman kalau multiproses menulis
 // ke file yang sama (misal Master + beberapa Child Worker).
+//
+// Menggunakan golang.org/x/sys/unix.Dup2 yang kompatibel dengan
+// linux/amd64, linux/arm64, linux/armv7, dan android/arm64.
 func RedirectStdio(path string) error {
 	redirectMu.Lock()
 	defer redirectMu.Unlock()
@@ -38,11 +42,11 @@ func RedirectStdio(path string) error {
 
 	fd := int(f.Fd())
 
-	if err := syscall.Dup2(fd, 1); err != nil {
+	if err := unix.Dup2(fd, 1); err != nil {
 		return err
 	}
 
-	if err := syscall.Dup2(fd, 2); err != nil {
+	if err := unix.Dup2(fd, 2); err != nil {
 		return err
 	}
 
