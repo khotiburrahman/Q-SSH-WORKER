@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -15,29 +16,42 @@ import (
 	"github.com/QcomWrt/Q-SSH-WORKER/socks"
 	workerssh "github.com/QcomWrt/Q-SSH-WORKER/ssh"
 	"github.com/QcomWrt/Q-SSH-WORKER/transport"
+	"github.com/QcomWrt/Q-SSH-WORKER/transport/response"
 )
 
-// StartWorker mengelola satu worker SSH.
-func StartWorker(cfg *config.Config) error {
+// ErrAuthFailed menandakan kredensial SSH / payload ditolak server.
+// Main akan menerjemahkan error ini menjadi exit code 5.
+var ErrAuthFailed = errors.New("auth_failed")
+
+// isSSHAuthError memeriksa apakah error dari SSH handshake adalah auth error.
+func isSSHAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+
+	return strings.Contains(s, "handshake") ||
+		strings.Contains(s, "auth") ||
+		strings.Contains(s, "credential") ||
+		strings.Contains(s, "password") ||
+		strings.Contains(s, "sign") ||
+		strings.Contains(s, "illegal") ||
+		strings.Contains(s, "rejected")
+}
+
+// StartWorker mengelola satu worker SSH sampai gagal.
+func StartWorker(ctx context.Context, cfg *config.Config) error {
 	reconnectPolicy := NewReconnectPolicy(
 		2*time.Second,
 		30*time.Second,
 	)
 
 	n, err := network.New(cfg)
-
 	if err != nil {
-		return fmt.Errorf(
-			"network init failed: %w",
-			err,
-		)
+		return fmt.Errorf("network init failed: %w", err)
 	}
 
 	var conn net.Conn
-
-	// ==============================================================
-	// LOG START CONNECTION
-	// ==============================================================
 
 	if cfg.Proxy.Host != "" {
 		logger.ProxyConnecting()
@@ -50,28 +64,18 @@ func StartWorker(cfg *config.Config) error {
 	// ==============================================================
 
 	for {
-		ctx, cancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second,
-		)
-
-		conn, err = n.Dial(ctx)
-
+		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		conn, err = n.Dial(dialCtx)
 		cancel()
 
 		if err != nil {
-			delay := reconnectPolicy.GetDelay()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 
-			logger.StatusError(
-				fmt.Sprintf(
-					"Connection failed: %v. Retrying in %v...",
-					err,
-					delay.Round(time.Second),
-				),
-			)
-
-			time.Sleep(delay)
-
+			if sleepErr := reconnectPolicy.Sleep(ctx); sleepErr != nil {
+				return sleepErr
+			}
 			continue
 		}
 
@@ -85,36 +89,28 @@ func StartWorker(cfg *config.Config) error {
 	// ==============================================================
 
 	workerStats := &TrafficStats{}
-
-	conn = NewObservedConn(
-		conn,
-		workerStats,
-	)
+	conn = NewObservedConn(conn, workerStats)
 
 	// ==============================================================
 	// TRANSPORT
 	// ==============================================================
 
-	wrappedConn, err := transport.Wrap(
-		cfg,
-		conn,
-	)
-
+	wrappedConn, err := transport.Wrap(cfg, conn)
 	if err != nil {
 		if conn != nil {
 			_ = conn.Close()
 		}
 
-		logger.ProxyError(err)
+		if errors.Is(err, response.ErrAuthFailed) {
+			logger.Errorf("[FATAL] Payload AUTH_FAILED: kredensial ditolak oleh gateway HTTP")
+			return ErrAuthFailed
+		}
 
+		logger.ProxyError(err)
 		return err
 	}
 
 	conn = wrappedConn
-
-	// ==============================================================
-	// TRANSPORT DEBUG
-	// ==============================================================
 
 	if cfg.Proxy.Host != "" {
 		debug.Proxy(
@@ -123,7 +119,6 @@ func StartWorker(cfg *config.Config) error {
 			cfg.SSH.Host,
 			cfg.SSH.Port,
 		)
-
 		logger.ProxyConnected()
 	}
 
@@ -133,35 +128,13 @@ func StartWorker(cfg *config.Config) error {
 	// SSH HANDSHAKE
 	// ==============================================================
 
-	client, err := workerssh.Dial(
-		cfg,
-		conn,
-	)
-
+	client, err := workerssh.Dial(cfg, conn)
 	if err != nil {
 		logger.SSHError(err)
 
-		errStr := strings.ToLower(
-			err.Error(),
-		)
-
-		if strings.Contains(errStr, "handshake") ||
-			strings.Contains(errStr, "auth") ||
-			strings.Contains(errStr, "credential") ||
-			strings.Contains(errStr, "password") ||
-			strings.Contains(errStr, "sign") ||
-			strings.Contains(errStr, "illegal") ||
-			strings.Contains(errStr, "rejected") {
-
-			println(
-				"\n🛑 [FATAL - AGENT KILLED] Kredensial SSH ditolak oleh server Dropbear!",
-			)
-
-			println(
-				"💡 Info: Akun sudah expired atau password salah. Memaksa mematikan Master Process...",
-			)
-
-			os.Exit(5)
+		if isSSHAuthError(err) {
+			logger.Errorf("[FATAL] Kredensial SSH ditolak oleh server Dropbear/OpenSSH")
+			return ErrAuthFailed
 		}
 
 		return err
@@ -174,11 +147,7 @@ func StartWorker(cfg *config.Config) error {
 	// ==============================================================
 
 	remoteIP := cfg.SSH.Host
-
-	if ips, err := net.LookupIP(
-		cfg.SSH.Host,
-	); err == nil && len(ips) > 0 {
-
+	if ips, err := net.LookupIP(cfg.SSH.Host); err == nil && len(ips) > 0 {
 		for _, ip := range ips {
 			if ip.To4() != nil {
 				remoteIP = ip.String()
@@ -187,11 +156,7 @@ func StartWorker(cfg *config.Config) error {
 		}
 	}
 
-	remoteAddrStr := fmt.Sprintf(
-		"%s:%d",
-		remoteIP,
-		cfg.SSH.Port,
-	)
+	remoteAddrStr := fmt.Sprintf("%s:%d", remoteIP, cfg.SSH.Port)
 
 	debug.SSHNetworkDetails(
 		cfg.Network.Type,
@@ -206,20 +171,15 @@ func StartWorker(cfg *config.Config) error {
 	// CONNECTION REGISTRY
 	// ==============================================================
 
-	workerID := os.Getenv(
-		"QTUN_TARGET_PORT",
-	)
-
+	workerID := os.Getenv("QTUN_TARGET_PORT")
 	if workerID == "" {
 		workerID = "unknown"
 	}
 
-	connectionRegistry := socks.NewConnectionRegistry(
-		workerID,
-	)
+	connectionRegistry := socks.NewConnectionRegistry(workerID)
 
-	fmt.Printf(
-		"[WORKER %s] Connection registry initialized (PID=%d)\n",
+	logger.Info(
+		"[WORKER %s] Connection registry initialized (PID=%d)",
 		workerID,
 		os.Getpid(),
 	)
@@ -231,24 +191,10 @@ func StartWorker(cfg *config.Config) error {
 	socksErrChan := make(chan error, 1)
 
 	go func() {
-
-		// ==========================================================
-		// DYNAMIC PORT
-		// ==========================================================
-
-		if envPort := os.Getenv(
-			"QTUN_TARGET_PORT",
-		); envPort != "" {
-
+		if envPort := os.Getenv("QTUN_TARGET_PORT"); envPort != "" {
 			var dynamicPort int
-
-			if _, err := fmt.Sscanf(
-				envPort,
-				"%d",
-				&dynamicPort,
-			); err == nil &&
+			if _, err := fmt.Sscanf(envPort, "%d", &dynamicPort); err == nil &&
 				dynamicPort > 0 {
-
 				cfg.Listen.Port = dynamicPort
 			}
 		}
@@ -264,190 +210,47 @@ func StartWorker(cfg *config.Config) error {
 	// HEALTH MONITOR
 	// ==============================================================
 
-	healthCtx, cancelHealth := context.WithCancel(
-		context.Background(),
-	)
-
+	healthCtx, cancelHealth := context.WithCancel(ctx)
 	defer cancelHealth()
 
-	healthResultChan := make(chan HealthResult, 4)
+	healthFailChan := make(chan bool, 1)
 
-	go MonitorHealth(
-		healthCtx,
-		client,
-		healthResultChan,
-	)
+	go MonitorHealth(healthCtx, client, healthFailChan)
 
 	// ==============================================================
-	// TRAFFIC MONITOR
-	// ==============================================================
-
-	statsCtx, cancelStats := context.WithCancel(
-		context.Background(),
-	)
-
-	defer cancelStats()
-
-	// Snapshot pertama.
-	previousStats := workerStats.Snapshot()
-
-	go func() {
-		ticker := time.NewTicker(
-			10 * time.Second,
-		)
-
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-statsCtx.Done():
-				return
-
-			case <-ticker.C:
-				rate, current := workerStats.Rate(
-					previousStats,
-				)
-
-				previousStats = current
-
-				active := connectionRegistry.ActiveCount()
-
-				fmt.Printf(
-					"[WORKER %s] STATS active=%d RX=%.2f KB/s TX=%.2f KB/s\n",
-					workerID,
-					active,
-					rate.RxBytesPerSec/1024,
-					rate.TxBytesPerSec/1024,
-				)
-			}
-		}
-	}()
-
-	// ==============================================================
-	// WAIT FOR FAILURE / HEALTH STATE
+	// WAIT FOR FAILURE / SHUTDOWN
 	// ==============================================================
 
 	var fatalErr error
 
-	for {
-		select {
-
-		case err := <-socksErrChan:
-
-			fatalErr = fmt.Errorf(
-				"socks5 server stopped: %v",
-				err,
-			)
-
-			goto shutdown
-
-		case health := <-healthResultChan:
-
-			switch health.Status {
-
-			case HealthHealthy:
-
-				fmt.Printf(
-					"[WORKER %s] HEALTHY latency=%v\n",
-					workerID,
-					health.Latency.Round(time.Millisecond),
-				)
-
-			case HealthDegraded:
-
-				if health.Err != nil {
-					fmt.Printf(
-						"[WORKER %s] DEGRADED latency=%v failures=%d err=%v\n",
-						workerID,
-						health.Latency.Round(time.Millisecond),
-						health.Failures,
-						health.Err,
-					)
-				} else {
-					fmt.Printf(
-						"[WORKER %s] DEGRADED latency=%v active=%d\n",
-						workerID,
-						health.Latency.Round(time.Millisecond),
-						connectionRegistry.ActiveCount(),
-					)
-				}
-
-				// PENTING:
-				//
-				// Jangan CloseAll().
-				// Jangan tutup SSH.
-				// Koneksi yang sedang berjalan dibiarkan.
-				//
-				// Pada tahap berikutnya status DEGRADED
-				// dapat dipakai untuk mencegah koneksi BARU
-				// masuk ke worker ini.
-
-				continue
-
-			case HealthDead:
-
-				fatalErr = fmt.Errorf(
-					"koneksi SSH mati: failures=%d latency=%v err=%v",
-					health.Failures,
-					health.Latency.Round(time.Millisecond),
-					health.Err,
-				)
-
-				goto shutdown
-			}
-		}
+	select {
+	case err := <-socksErrChan:
+		fatalErr = fmt.Errorf("socks5 server stopped: %v", err)
+	case <-healthFailChan:
+		fatalErr = errors.New("ssh keepalive failed, connection considered dead")
+	case <-ctx.Done():
+		fatalErr = ctx.Err()
 	}
 
-	// ==============================================================
-	// WORKER SHUTDOWN
-	//
-	// Urutan:
-	//
-	// 1. Stop health monitor
-	// 2. Stop stats monitor
-	// 3. Close seluruh koneksi HP
-	// 4. Close SSH client
-	// 5. Close transport
-	// 6. Return ke master
-	// ==============================================================
-
-shutdown:
-
-	fmt.Printf(
-		"[WORKER %s] Shutdown initiated: %v\n",
+	logger.Info(
+		"[WORKER %s] Shutdown initiated: %v",
 		workerID,
 		fatalErr,
 	)
 
 	cancelHealth()
-	cancelStats()
-
-	// ==============================================================
-	// CLOSE SEMUA KONEKSI SOCKS
-	// ==============================================================
-
-	connectionRegistry.CloseAll(
-		"worker_shutdown",
-	)
-
-	// ==============================================================
-	// CLOSE SSH CLIENT
-	// ==============================================================
+	connectionRegistry.CloseAll("worker_shutdown")
 
 	if client != nil {
 		_ = client.Close()
 	}
 
-	// ==============================================================
-	// CLOSE TRANSPORT
-	// ==============================================================
-
 	if conn != nil {
 		_ = conn.Close()
 	}
 
-	fmt.Printf(
-		"[WORKER %s] Shutdown complete (PID=%d)\n",
+	logger.Info(
+		"[WORKER %s] Shutdown complete (PID=%d)",
 		workerID,
 		os.Getpid(),
 	)

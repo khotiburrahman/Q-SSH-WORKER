@@ -14,6 +14,11 @@ import (
 	"github.com/QcomWrt/Q-SSH-WORKER/internal"
 )
 
+// ErrAuthFailed menandakan kredensial ditolak oleh server (baik dari payload HTTP
+// maupun dari SSH handshake). Worker manager akan menerjemahkan ini menjadi
+// exit code 5 agar Master dapat mematikan seluruh worker sekaligus.
+var ErrAuthFailed = errors.New("auth_failed")
+
 func Once(cfg *config.Config, conn net.Conn, secondPart string) (net.Conn, error) {
 	reader := bufio.NewReader(conn)
 
@@ -24,7 +29,6 @@ func Once(cfg *config.Config, conn net.Conn, secondPart string) (net.Conn, error
 	}
 	line = strings.TrimRight(line, "\r\n")
 
-	// Ekstrak komponen Status Line (Contoh: "HTTP/1.1 301 Moved Permanently")
 	parts := strings.SplitN(line, " ", 3)
 	version := "HTTP/1.1"
 	statusCode := 0
@@ -39,9 +43,8 @@ func Once(cfg *config.Config, conn net.Conn, secondPart string) (net.Conn, error
 		status = line
 	}
 
-	// 2. Baca dan kumpulkan seluruh HTTP Headers ke dalam map
+	// 2. Baca dan kumpulkan seluruh HTTP Headers
 	headers := make(map[string]string)
-	var headerLines []string
 	for {
 		hl, err := reader.ReadString('\n')
 		if err != nil {
@@ -49,11 +52,9 @@ func Once(cfg *config.Config, conn net.Conn, secondPart string) (net.Conn, error
 		}
 		trimmedHl := strings.TrimRight(hl, "\r\n")
 		if trimmedHl == "" {
-			break // Batas akhir header didapatkan (\r\n\r\n)
+			break
 		}
-		headerLines = append(headerLines, hl) // Simpan untuk dikuras nanti jika diperlukan
 
-		// Masukkan ke map key-value
 		if idx := strings.Index(trimmedHl, ":"); idx != -1 {
 			k := strings.TrimSpace(trimmedHl[:idx])
 			v := strings.TrimSpace(trimmedHl[idx+1:])
@@ -61,9 +62,6 @@ func Once(cfg *config.Config, conn net.Conn, secondPart string) (net.Conn, error
 		}
 	}
 
-	// ======================================================================
-	// 🟢 PANGGIL SUB-SYSTEM DEBUG RESPONSE ASLI MILIKMU
-	// ======================================================================
 	debug.Response(version, statusCode, status, headers)
 
 	// SKENARIO A: RESPONS LANGSUNG SUKSES (101 / 200)
@@ -112,36 +110,33 @@ func Once(cfg *config.Config, conn net.Conn, secondPart string) (net.Conn, error
 				_ = conn.SetReadDeadline(time.Time{})
 
 				fullBody := strings.ToLower(collectedBody.String())
-				
-				// 1. Cek mutlak jika ada indikasi akun mati/expired di dalam bodi respon
-				if strings.Contains(fullBody, "expired") || strings.Contains(fullBody, "reject") || strings.Contains(fullBody, "auth") {
+
+				if strings.Contains(fullBody, "expired") ||
+					strings.Contains(fullBody, "reject") ||
+					strings.Contains(fullBody, "auth") {
+
 					debug.EvaluateRejectResponse(statusCode, status, headers, conn, reader)
-					return conn, errors.New("AUTH_FAILED")
+					return conn, ErrAuthFailed
 				}
 
-				// 2. Jika akun aktif tapi tetap EOF karena Cloudflare nge-drop koneksi (seperti log kamu)
 				if err == io.EOF {
-					// Jika di dalam bodi chunked Cloudflare tidak ada info expired, artinya bug host/payload-mu yang mental
 					if debug.Enable {
 						debug.Println("[TUNNEL TRICK] Koneksi diputus Cloudflare (EOF). Mencoba meneruskan reader...")
 					}
-					
-					// Paksa bungkus sisa buffer yang ada, jangan langsung matikan worker
+
 					if reader.Buffered() > 0 {
 						stream := io.MultiReader(reader, conn)
 						return internal.NewBufferedConn(conn, stream), nil
 					}
-					
-					// Jika buffer kosong total dan tidak ada indikasi expired, return eror murni agar master tahu ini masalah jaringan/payload
+
 					return nil, err
 				}
-				
+
 				return nil, err
 			}
 
 			collectedBody.WriteString(peekLine)
 
-			// Jika banner SSH ditemukan di sela-sela pembersihan bodi
 			if strings.HasPrefix(peekLine, "SSH-") {
 				_ = conn.SetReadDeadline(time.Time{})
 
@@ -153,16 +148,10 @@ func Once(cfg *config.Config, conn net.Conn, secondPart string) (net.Conn, error
 		}
 	}
 
-	// ======================================================================
-	// 🛑 SKENARIO C: RESPONS ERROR PENOLAKAN DARI SERVER (400, 403, 503, dll)
-	// ======================================================================
+	// SKENARIO C: RESPONS ERROR PENOLAKAN DARI SERVER (400, 403, 503, dll)
 	if statusCode >= 400 && statusCode < 600 {
-
-		// 🟢 Panggil fungsi terpusat di package debug. Bersih dan tidak berceceran!
 		debug.EvaluateRejectResponse(statusCode, status, headers, conn, reader)
-
-		// Kembalikan objek koneksi dan error otentikasi murni ke Master Manager
-		return conn, errors.New("AUTH_FAILED")
+		return conn, ErrAuthFailed
 	}
 
 	if reader.Buffered() > 0 {

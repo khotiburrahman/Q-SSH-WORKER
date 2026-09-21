@@ -1,31 +1,21 @@
 package socks
 
 import (
-	"fmt"
 	"io"
 	"net"
+
+	"github.com/QcomWrt/Q-SSH-WORKER/internal"
+	"github.com/QcomWrt/Q-SSH-WORKER/logger"
 )
 
-// relayResult menyimpan hasil satu arah relay.
 type relayResult struct {
 	direction string
 	bytes     int64
 	err       error
 }
 
-// Relay melakukan relay data dua arah antara client SOCKS
-// dan SSH channel.
-//
-// Lifecycle:
-//
-//	client <-> SSH channel
-//	    │
-//	    ├── CLIENT_TO_REMOTE
-//	    │
-//	    └── REMOTE_TO_CLIENT
-//
-// Jika salah satu arah selesai/error, kedua koneksi ditutup
-// agar arah lainnya tidak menggantung.
+// Relay melakukan relay data dua arah antara client SOCKS dan SSH channel,
+// menggunakan buffer 32KB dari sync.Pool untuk menekan GC pressure.
 func Relay(
 	client net.Conn,
 	remote net.Conn,
@@ -33,97 +23,67 @@ func Relay(
 ) {
 	resultChan := make(chan relayResult, 2)
 
-	fmt.Printf(
-		"[%s] RELAY START client=%s remote=%s\n",
+	logger.Debug(
+		"[%s] RELAY START client=%s remote=%s",
 		connectionID,
 		client.RemoteAddr(),
 		remote.RemoteAddr(),
 	)
 
-	// ==============================================================
-	// ARAH 1:
-	// CLIENT → SSH → VPS → INTERNET
-	// ==============================================================
-
-	go func() {
-		fmt.Printf(
-			"[%s] RELAY COPY START direction=CLIENT_TO_REMOTE\n",
+	copyWithPool := func(dst net.Conn, src net.Conn, direction string) {
+		logger.Debug(
+			"[%s] RELAY COPY START direction=%s",
 			connectionID,
+			direction,
 		)
 
-		n, err := io.Copy(remote, client)
+		buf := internal.GetBuffer()
+		defer internal.PutBuffer(buf)
+
+		n, err := io.CopyBuffer(dst, src, buf)
 
 		resultChan <- relayResult{
-			direction: "CLIENT_TO_REMOTE",
+			direction: direction,
 			bytes:     n,
 			err:       err,
 		}
-	}()
+	}
 
-	// ==============================================================
-	// ARAH 2:
-	// INTERNET → VPS → SSH → CLIENT
-	// ==============================================================
+	// ARAH 1: CLIENT → SSH → VPS → INTERNET
+	go copyWithPool(remote, client, "CLIENT_TO_REMOTE")
 
-	go func() {
-		fmt.Printf(
-			"[%s] RELAY COPY START direction=REMOTE_TO_CLIENT\n",
-			connectionID,
-		)
+	// ARAH 2: INTERNET → VPS → SSH → CLIENT
+	go copyWithPool(client, remote, "REMOTE_TO_CLIENT")
 
-		n, err := io.Copy(client, remote)
-
-		resultChan <- relayResult{
-			direction: "REMOTE_TO_CLIENT",
-			bytes:     n,
-			err:       err,
-		}
-	}()
-
-	// ==============================================================
-	// TUNGGU ARAH PERTAMA
-	// ==============================================================
-
+	// Tunggu arah pertama selesai
 	first := <-resultChan
 
-	fmt.Printf(
-		"[%s] RELAY FIRST END direction=%s bytes=%d err=%v\n",
+	logger.Debug(
+		"[%s] RELAY FIRST END direction=%s bytes=%d err=%v",
 		connectionID,
 		first.direction,
 		first.bytes,
 		first.err,
 	)
 
-	// ==============================================================
-	// TUTUP KEDUA SISI
-	//
-	// Ini memaksa io.Copy arah kedua keluar dari blocking read/write.
-	// ==============================================================
-
-	fmt.Printf(
-		"[%s] RELAY FORCE CLOSE BOTH DIRECTIONS\n",
+	logger.Debug(
+		"[%s] RELAY FORCE CLOSE BOTH DIRECTIONS",
 		connectionID,
 	)
 
 	_ = client.Close()
 	_ = remote.Close()
 
-	// ==============================================================
-	// TUNGGU ARAH KEDUA
-	// ==============================================================
-
+	// Tunggu arah kedua (yang sekarang sudah ter-unblock)
 	second := <-resultChan
 
-	fmt.Printf(
-		"[%s] RELAY SECOND END direction=%s bytes=%d err=%v\n",
+	logger.Debug(
+		"[%s] RELAY SECOND END direction=%s bytes=%d err=%v",
 		connectionID,
 		second.direction,
 		second.bytes,
 		second.err,
 	)
 
-	fmt.Printf(
-		"[%s] RELAY END\n",
-		connectionID,
-	)
+	logger.Debug("[%s] RELAY END", connectionID)
 }

@@ -9,48 +9,21 @@ import (
 )
 
 const (
-	HealthHealthy  = "HEALTHY"
-	HealthDegraded = "DEGRADED"
-	HealthDead     = "DEAD"
-
-	healthInterval = 30 * time.Second
-	healthTimeout  = 5 * time.Second
-
-	// Jika channel SSH berhasil dibuka tetapi membutuhkan
-	// lebih dari nilai ini, worker dianggap sedang degraded.
-	degradedLatency = 1500 * time.Millisecond
-
-	// Dua kegagalan berturut-turut tetap diperlukan
-	// sebelum worker dianggap benar-benar DEAD.
-	maxHealthFailures = 2
+	healthInterval     = 15 * time.Second
+	healthMaxFailures  = 3
+	keepaliveTimeout   = 10 * time.Second
 )
 
-// HealthResult adalah hasil satu kali pemeriksaan worker.
-type HealthResult struct {
-	Status   string
-	Latency  time.Duration
-	Failures int
-	Err      error
-}
-
-// MonitorHealth memeriksa kualitas koneksi SSH secara berkala.
+// MonitorHealth melakukan ping berkala ke server SSH menggunakan
+// protokol keepalive@openssh.com.
 //
-// HEALTHY:
-//   channel SSH berhasil dibuka dengan latency normal.
-//
-// DEGRADED:
-//   channel SSH masih berhasil dibuka tetapi latency tinggi.
-//
-// DEAD:
-//   channel SSH gagal dibuka beberapa kali berturut-turut.
-//
-// Penting:
-// DEGRADED tidak menyebabkan worker dimatikan.
-// Hanya DEAD yang dikirim ke manager sebagai kondisi fatal.
+// Jika SSH benar-benar mati gantung, ia akan mengirim sinyal true ke failChan.
+// Kegagalan ini TIDAK dipicu oleh gangguan internet keluar dari VPS,
+// hanya oleh SSH session itu sendiri.
 func MonitorHealth(
 	ctx context.Context,
 	sshClient *gossh.Client,
-	resultChan chan<- HealthResult,
+	failChan chan<- bool,
 ) {
 	ticker := time.NewTicker(healthInterval)
 	defer ticker.Stop()
@@ -61,113 +34,58 @@ func MonitorHealth(
 		select {
 		case <-ctx.Done():
 			return
-
 		case <-ticker.C:
-			result := checkHealth(
-				ctx,
-				sshClient,
-				&failureCount,
+			logger.Debug(
+				"[HEALTH] tick at %s failure=%d",
+				time.Now().Format(time.RFC3339),
+				failureCount,
 			)
 
-			select {
-			case resultChan <- result:
-			case <-ctx.Done():
+			if sshClient == nil {
 				return
 			}
 
-			if result.Status == HealthDead {
-				logger.StatusError(
-					"Koneksi SSH benar-benar gagal; worker akan direconnect.",
+			done := make(chan error, 1)
+			go func() {
+				_, _, err := sshClient.SendRequest(
+					"keepalive@openssh.com",
+					true,
+					nil,
 				)
+				done <- err
+			}()
+
+			select {
+			case err := <-done:
+				if err == nil {
+					failureCount = 0
+					continue
+				}
+
+				failureCount++
+				logger.Warn(
+					"[HEALTH] keepalive failed (%d/%d): %v",
+					failureCount,
+					healthMaxFailures,
+					err,
+				)
+			case <-time.After(keepaliveTimeout):
+				failureCount++
+				logger.Warn(
+					"[HEALTH] keepalive timeout (%d/%d)",
+					failureCount,
+					healthMaxFailures,
+				)
+			}
+
+			if failureCount >= healthMaxFailures {
+				logger.Errorf(
+					"[HEALTH] SSH keepalive failed %d times, connection considered dead",
+					failureCount,
+				)
+				failChan <- true
 				return
 			}
 		}
-	}
-}
-
-// checkHealth melakukan satu kali pengecekan channel SSH.
-func checkHealth(
-	ctx context.Context,
-	sshClient *gossh.Client,
-	failureCount *int,
-) HealthResult {
-
-	start := time.Now()
-
-	// ssh.Client.Dial tidak menerima context.
-	// Karena itu kita jalankan dalam goroutine dan memberikan
-	// batas waktu maksimum di sisi monitor.
-	done := make(chan error, 1)
-
-	go func() {
-		conn, err := sshClient.Dial(
-			"tcp",
-			"1.1.1.1:80",
-		)
-
-		if err == nil && conn != nil {
-			_ = conn.Close()
-		}
-
-		done <- err
-	}()
-
-	var err error
-
-	select {
-	case <-ctx.Done():
-		return HealthResult{
-			Status:   HealthDead,
-			Failures: *failureCount,
-			Err:      ctx.Err(),
-		}
-
-	case <-time.After(healthTimeout):
-		err = context.DeadlineExceeded
-
-	case err = <-done:
-	}
-
-	latency := time.Since(start)
-
-	// ==========================================================
-	// GAGAL
-	// ==========================================================
-
-	if err != nil {
-		*failureCount++
-
-		status := HealthDegraded
-
-		if *failureCount >= maxHealthFailures {
-			status = HealthDead
-		}
-
-		return HealthResult{
-			Status:   status,
-			Latency:  latency,
-			Failures: *failureCount,
-			Err:      err,
-		}
-	}
-
-	// ==========================================================
-	// BERHASIL
-	// ==========================================================
-
-	// Satu keberhasilan langsung mereset failure counter.
-	*failureCount = 0
-
-	status := HealthHealthy
-
-	if latency >= degradedLatency {
-		status = HealthDegraded
-	}
-
-	return HealthResult{
-		Status:   status,
-		Latency:  latency,
-		Failures: 0,
-		Err:      nil,
 	}
 }
