@@ -210,8 +210,7 @@ func main() {
 					}
 				}
 
-				// Backoff adaptif: kalau anak hidup lama, respawn cepat.
-				// Kalau anak cepat mati, tunggu lebih lama.
+				// Backoff adaptif
 				var delay time.Duration
 				switch {
 				case aliveFor > 5*time.Minute:
