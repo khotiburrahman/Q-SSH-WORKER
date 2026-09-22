@@ -32,7 +32,6 @@ func isSSHAuthError(err error) bool {
 	}
 	s := strings.ToLower(err.Error())
 
-	// Auth failure sejati dari x/crypto/ssh
 	if strings.Contains(s, "unable to authenticate") {
 		return true
 	}
@@ -42,8 +41,6 @@ func isSSHAuthError(err error) bool {
 	if strings.Contains(s, "permission denied") {
 		return true
 	}
-
-	// Auth failure dari Dropbear/OpenSSH
 	if strings.Contains(s, "auth failed") {
 		return true
 	}
@@ -64,9 +61,23 @@ func isSSHAuthError(err error) bool {
 // master spawn ulang.
 func StartWorker(ctx context.Context, cfg *config.Config) error {
 	policy := NewReconnectPolicy(2*time.Second, 30*time.Second)
+	cycleCount := 0
 
 	for {
+		cycleCount++
+
+		logger.Info("")
+		logger.Info("========== CYCLE %d START ==========", cycleCount)
+
+		cycleStart := time.Now()
 		err := runOnce(ctx, cfg)
+		aliveFor := time.Since(cycleStart)
+
+		logger.Info("========== CYCLE %d END (uptime %v) ==========",
+			cycleCount,
+			aliveFor.Round(time.Second),
+		)
+		logger.Info("")
 
 		if err == nil {
 			continue
@@ -81,6 +92,13 @@ func StartWorker(ctx context.Context, cfg *config.Config) error {
 		}
 
 		logger.Warn("[WORKER] koneksi terputus: %v", err)
+
+		// Reset backoff hanya kalau worker sempat hidup lama (>60 detik).
+		// Ini mencegah worker yang crash cepat (misal Cloudflare rate-limit)
+		// melakukan reconnect terlalu agresif.
+		if aliveFor > 60*time.Second {
+			policy.Reset()
+		}
 
 		if sleepErr := policy.Sleep(ctx); sleepErr != nil {
 			return sleepErr
@@ -184,8 +202,6 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 	logger.Info("[WORKER %s] registry init (PID=%d)", workerID, os.Getpid())
 
 	// ---- SOCKS SERVER ----
-	// Buat context khusus SOCKS supaya listener bisa ditutup
-	// ketika runOnce selesai, sebelum loop berikutnya bind port yang sama.
 	socksCtx, cancelSocks := context.WithCancel(ctx)
 	defer cancelSocks()
 
@@ -224,28 +240,20 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 	logger.Info("[WORKER %s] shutdown: %v", workerID, fatalErr)
 
 	// ---- SHUTDOWN BERURUTAN ----
-	// 1. Stop health monitor
 	cancelHealth()
-
-	// 2. Stop listener SOCKS dan TUNGGU benar-benar close
 	cancelSocks()
 
 	select {
 	case <-socksErrChan:
-		// listener selesai
 	case <-time.After(3 * time.Second):
 		logger.Warn("[WORKER %s] listener tidak close dalam 3 detik", workerID)
 	}
 
-	// 3. Tutup semua koneksi SOCKS aktif
 	connectionRegistry.CloseAll("worker_shutdown")
 
-	// 4. Tutup SSH client
 	if client != nil {
 		_ = client.Close()
 	}
-
-	// 5. Tutup transport
 	if conn != nil {
 		_ = conn.Close()
 	}
