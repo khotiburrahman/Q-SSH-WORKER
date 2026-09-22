@@ -19,33 +19,86 @@ import (
 	"github.com/QcomWrt/Q-SSH-WORKER/transport/response"
 )
 
-// ErrAuthFailed menandakan kredensial SSH / payload ditolak server.
-// Main akan menerjemahkan error ini menjadi exit code 5.
+// ErrAuthFailed menandakan kredensial SSH / payload benar-benar ditolak
+// oleh server (bukan karena transport rusak).
 var ErrAuthFailed = errors.New("auth_failed")
 
-// isSSHAuthError memeriksa apakah error dari SSH handshake adalah auth error.
+// isSSHAuthError HANYA return true kalau server SSH benar-benar menolak
+// kredensial. Error transport seperti EOF, connection reset, atau
+// "overflow reading version string" BUKAN auth error.
+//
+// golang.org/x/crypto/ssh membungkus SEMUA error handshake dengan prefix
+// "ssh: handshake failed: ...", jadi tidak boleh match hanya dari kata
+// "handshake".
 func isSSHAuthError(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := strings.ToLower(err.Error())
 
-	return strings.Contains(s, "handshake") ||
-		strings.Contains(s, "auth") ||
-		strings.Contains(s, "credential") ||
-		strings.Contains(s, "password") ||
-		strings.Contains(s, "sign") ||
-		strings.Contains(s, "illegal") ||
-		strings.Contains(s, "rejected")
+	// Auth failure sejati dari x/crypto/ssh
+	if strings.Contains(s, "unable to authenticate") {
+		return true
+	}
+	if strings.Contains(s, "no supported methods remain") {
+		return true
+	}
+	if strings.Contains(s, "permission denied") {
+		return true
+	}
+
+	// Auth failure dari Dropbear/OpenSSH
+	if strings.Contains(s, "auth failed") {
+		return true
+	}
+	if strings.Contains(s, "authentication failed") {
+		return true
+	}
+
+	return false
 }
 
-// StartWorker mengelola satu worker SSH sampai gagal.
+// StartWorker menjalankan worker dengan loop reconnect internal.
+//
+// Hanya return kalau:
+//   - Kredensial benar-benar ditolak (return ErrAuthFailed)
+//   - Context dibatalkan (return ctx.Err())
+//
+// Selain itu, worker akan terus reconnect sendiri tanpa perlu
+// master spawn ulang.
 func StartWorker(ctx context.Context, cfg *config.Config) error {
-	reconnectPolicy := NewReconnectPolicy(
-		2*time.Second,
-		30*time.Second,
-	)
+	policy := NewReconnectPolicy(2*time.Second, 30*time.Second)
 
+	for {
+		err := runOnce(ctx, cfg)
+
+		if err == nil {
+			// Seharusnya tidak terjadi, tapi kalau terjadi, ulang.
+			continue
+		}
+
+		// Kalau auth gagal, jangan ulang — kembalikan ke master.
+		if errors.Is(err, ErrAuthFailed) {
+			return err
+		}
+
+		// Kalau context dibatalkan, keluar bersih.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		logger.Warn("[WORKER] koneksi terputus: %v. Reconnect dalam sebentar...", err)
+
+		if sleepErr := policy.Sleep(ctx); sleepErr != nil {
+			return sleepErr
+		}
+	}
+}
+
+// runOnce menjalankan satu siklus hidup worker: dial, transport, SSH,
+// SOCKS listen. Return error begitu salah satu tahap gagal atau
+// health check mendeteksi koneksi mati.
+func runOnce(ctx context.Context, cfg *config.Config) error {
 	n, err := network.New(cfg)
 	if err != nil {
 		return fmt.Errorf("network init failed: %w", err)
@@ -59,95 +112,64 @@ func StartWorker(ctx context.Context, cfg *config.Config) error {
 		logger.TCPConnecting()
 	}
 
-	// ==============================================================
-	// INITIAL NETWORK DIAL
-	// ==============================================================
+	// ---- INITIAL NETWORK DIAL ----
+	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
+	conn, err = n.Dial(dialCtx)
+	dialCancel()
 
-	for {
-		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		conn, err = n.Dial(dialCtx)
-		cancel()
-
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-
-			if sleepErr := reconnectPolicy.Sleep(ctx); sleepErr != nil {
-				return sleepErr
-			}
-			continue
-		}
-
-		break
+	if err != nil {
+		return fmt.Errorf("dial failed: %w", err)
 	}
 
-	reconnectPolicy.Reset()
-
-	// ==============================================================
-	// OBSERVED CONNECTION
-	// ==============================================================
-
+	// ---- OBSERVED CONNECTION ----
 	workerStats := &TrafficStats{}
 	conn = NewObservedConn(conn, workerStats)
 
-	// ==============================================================
-	// TRANSPORT
-	// ==============================================================
-
+	// ---- TRANSPORT ----
 	wrappedConn, err := transport.Wrap(cfg, conn)
 	if err != nil {
-		if conn != nil {
-			_ = conn.Close()
-		}
+		_ = conn.Close()
 
 		if errors.Is(err, response.ErrAuthFailed) {
-			logger.Errorf("[FATAL] Payload AUTH_FAILED: kredensial ditolak oleh gateway HTTP")
+			logger.Errorf("[FATAL] Payload AUTH_FAILED: kredensial ditolak gateway HTTP")
 			return ErrAuthFailed
 		}
 
 		logger.ProxyError(err)
-		return err
+		return fmt.Errorf("transport failed: %w", err)
 	}
 
 	conn = wrappedConn
 
 	if cfg.Proxy.Host != "" {
-		debug.Proxy(
-			cfg.Proxy.Host,
-			cfg.Proxy.Port,
-			cfg.SSH.Host,
-			cfg.SSH.Port,
-		)
+		debug.Proxy(cfg.Proxy.Host, cfg.Proxy.Port, cfg.SSH.Host, cfg.SSH.Port)
 		logger.ProxyConnected()
 	}
 
+	// ---- SSH HANDSHAKE ----
 	logger.SSHConnecting()
-
-	// ==============================================================
-	// SSH HANDSHAKE
-	// ==============================================================
 
 	client, err := workerssh.Dial(cfg, conn)
 	if err != nil {
 		logger.SSHError(err)
+		_ = conn.Close()
 
+		// Hanya return ErrAuthFailed kalau BENAR-BENAR auth error.
+		// Kalau transport rusak (Cloudflare drop, EOF, reset),
+		// return error biasa supaya loop reconnect.
 		if isSSHAuthError(err) {
-			logger.Errorf("[FATAL] Kredensial SSH ditolak oleh server Dropbear/OpenSSH")
+			logger.Errorf("[FATAL] Kredensial SSH ditolak server")
 			return ErrAuthFailed
 		}
 
-		return err
+		return fmt.Errorf("ssh handshake failed: %w", err)
 	}
 
 	logger.SSHConnected()
 
-	// ==============================================================
-	// REMOTE IP DEBUG
-	// ==============================================================
-
+	// ---- REMOTE IP DEBUG ----
 	remoteIP := cfg.SSH.Host
-	if ips, err := net.LookupIP(cfg.SSH.Host); err == nil && len(ips) > 0 {
+	if ips, lookupErr := net.LookupIP(cfg.SSH.Host); lookupErr == nil && len(ips) > 0 {
 		for _, ip := range ips {
 			if ip.To4() != nil {
 				remoteIP = ip.String()
@@ -157,20 +179,11 @@ func StartWorker(ctx context.Context, cfg *config.Config) error {
 	}
 
 	remoteAddrStr := fmt.Sprintf("%s:%d", remoteIP, cfg.SSH.Port)
-
-	debug.SSHNetworkDetails(
-		cfg.Network.Type,
-		remoteAddrStr,
-		conn.RemoteAddr(),
-		conn.LocalAddr(),
-	)
+	debug.SSHNetworkDetails(cfg.Network.Type, remoteAddrStr, conn.RemoteAddr(), conn.LocalAddr())
 
 	logger.StatusConnected()
 
-	// ==============================================================
-	// CONNECTION REGISTRY
-	// ==============================================================
-
+	// ---- CONNECTION REGISTRY ----
 	workerID := os.Getenv("QTUN_TARGET_PORT")
 	if workerID == "" {
 		workerID = "unknown"
@@ -178,65 +191,42 @@ func StartWorker(ctx context.Context, cfg *config.Config) error {
 
 	connectionRegistry := socks.NewConnectionRegistry(workerID)
 
-	logger.Info(
-		"[WORKER %s] Connection registry initialized (PID=%d)",
-		workerID,
-		os.Getpid(),
-	)
+	logger.Info("[WORKER %s] registry init (PID=%d)", workerID, os.Getpid())
 
-	// ==============================================================
-	// SOCKS SERVER
-	// ==============================================================
-
+	// ---- SOCKS SERVER ----
 	socksErrChan := make(chan error, 1)
 
 	go func() {
 		if envPort := os.Getenv("QTUN_TARGET_PORT"); envPort != "" {
 			var dynamicPort int
-			if _, err := fmt.Sscanf(envPort, "%d", &dynamicPort); err == nil &&
-				dynamicPort > 0 {
+			if _, scanErr := fmt.Sscanf(envPort, "%d", &dynamicPort); scanErr == nil && dynamicPort > 0 {
 				cfg.Listen.Port = dynamicPort
 			}
 		}
 
-		socksErrChan <- socks.ListenAndServe(
-			cfg,
-			client,
-			connectionRegistry,
-		)
+		socksErrChan <- socks.ListenAndServe(cfg, client, connectionRegistry)
 	}()
 
-	// ==============================================================
-	// HEALTH MONITOR
-	// ==============================================================
-
+	// ---- HEALTH MONITOR ----
 	healthCtx, cancelHealth := context.WithCancel(ctx)
 	defer cancelHealth()
 
 	healthFailChan := make(chan bool, 1)
-
 	go MonitorHealth(healthCtx, client, healthFailChan)
 
-	// ==============================================================
-	// WAIT FOR FAILURE / SHUTDOWN
-	// ==============================================================
-
+	// ---- WAIT FOR FAILURE ----
 	var fatalErr error
 
 	select {
 	case err := <-socksErrChan:
-		fatalErr = fmt.Errorf("socks5 server stopped: %v", err)
+		fatalErr = fmt.Errorf("socks listener stopped: %w", err)
 	case <-healthFailChan:
-		fatalErr = errors.New("ssh keepalive failed, connection considered dead")
+		fatalErr = errors.New("health check: koneksi mati")
 	case <-ctx.Done():
 		fatalErr = ctx.Err()
 	}
 
-	logger.Info(
-		"[WORKER %s] Shutdown initiated: %v",
-		workerID,
-		fatalErr,
-	)
+	logger.Info("[WORKER %s] shutdown: %v", workerID, fatalErr)
 
 	cancelHealth()
 	connectionRegistry.CloseAll("worker_shutdown")
@@ -244,16 +234,11 @@ func StartWorker(ctx context.Context, cfg *config.Config) error {
 	if client != nil {
 		_ = client.Close()
 	}
-
 	if conn != nil {
 		_ = conn.Close()
 	}
 
-	logger.Info(
-		"[WORKER %s] Shutdown complete (PID=%d)",
-		workerID,
-		os.Getpid(),
-	)
+	logger.Info("[WORKER %s] shutdown selesai", workerID)
 
 	return fatalErr
 }
