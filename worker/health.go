@@ -20,7 +20,7 @@ const (
 // Ini mengecek 3 hal sekaligus:
 //  1. SSH session masih hidup
 //  2. Channel subsystem masih bisa dibuka
-//  3. Jalur end-to-end (router → Cloudflare → VPS) masih tembus
+//  3. Jalur end-to-end (router -> Cloudflare -> VPS) masih tembus
 //
 // Kalau salah satu rusak (termasuk Cloudflare silent drop), probe gagal.
 func MonitorHealth(
