@@ -26,10 +26,6 @@ var ErrAuthFailed = errors.New("auth_failed")
 // isSSHAuthError HANYA return true kalau server SSH benar-benar menolak
 // kredensial. Error transport seperti EOF, connection reset, atau
 // "overflow reading version string" BUKAN auth error.
-//
-// golang.org/x/crypto/ssh membungkus SEMUA error handshake dengan prefix
-// "ssh: handshake failed: ...", jadi tidak boleh match hanya dari kata
-// "handshake".
 func isSSHAuthError(err error) bool {
 	if err == nil {
 		return false
@@ -73,21 +69,18 @@ func StartWorker(ctx context.Context, cfg *config.Config) error {
 		err := runOnce(ctx, cfg)
 
 		if err == nil {
-			// Seharusnya tidak terjadi, tapi kalau terjadi, ulang.
 			continue
 		}
 
-		// Kalau auth gagal, jangan ulang — kembalikan ke master.
 		if errors.Is(err, ErrAuthFailed) {
 			return err
 		}
 
-		// Kalau context dibatalkan, keluar bersih.
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		logger.Warn("[WORKER] koneksi terputus: %v. Reconnect dalam sebentar...", err)
+		logger.Warn("[WORKER] koneksi terputus: %v", err)
 
 		if sleepErr := policy.Sleep(ctx); sleepErr != nil {
 			return sleepErr
@@ -154,9 +147,6 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 		logger.SSHError(err)
 		_ = conn.Close()
 
-		// Hanya return ErrAuthFailed kalau BENAR-BENAR auth error.
-		// Kalau transport rusak (Cloudflare drop, EOF, reset),
-		// return error biasa supaya loop reconnect.
 		if isSSHAuthError(err) {
 			logger.Errorf("[FATAL] Kredensial SSH ditolak server")
 			return ErrAuthFailed
@@ -194,6 +184,11 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 	logger.Info("[WORKER %s] registry init (PID=%d)", workerID, os.Getpid())
 
 	// ---- SOCKS SERVER ----
+	// Buat context khusus SOCKS supaya listener bisa ditutup
+	// ketika runOnce selesai, sebelum loop berikutnya bind port yang sama.
+	socksCtx, cancelSocks := context.WithCancel(ctx)
+	defer cancelSocks()
+
 	socksErrChan := make(chan error, 1)
 
 	go func() {
@@ -204,7 +199,7 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 			}
 		}
 
-		socksErrChan <- socks.ListenAndServe(cfg, client, connectionRegistry)
+		socksErrChan <- socks.ListenAndServe(socksCtx, cfg, client, connectionRegistry)
 	}()
 
 	// ---- HEALTH MONITOR ----
@@ -228,12 +223,29 @@ func runOnce(ctx context.Context, cfg *config.Config) error {
 
 	logger.Info("[WORKER %s] shutdown: %v", workerID, fatalErr)
 
+	// ---- SHUTDOWN BERURUTAN ----
+	// 1. Stop health monitor
 	cancelHealth()
+
+	// 2. Stop listener SOCKS dan TUNGGU benar-benar close
+	cancelSocks()
+
+	select {
+	case <-socksErrChan:
+		// listener selesai
+	case <-time.After(3 * time.Second):
+		logger.Warn("[WORKER %s] listener tidak close dalam 3 detik", workerID)
+	}
+
+	// 3. Tutup semua koneksi SOCKS aktif
 	connectionRegistry.CloseAll("worker_shutdown")
 
+	// 4. Tutup SSH client
 	if client != nil {
 		_ = client.Close()
 	}
+
+	// 5. Tutup transport
 	if conn != nil {
 		_ = conn.Close()
 	}
