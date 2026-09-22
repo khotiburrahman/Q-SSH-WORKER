@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/QcomWrt/Q-SSH-WORKER/logger"
@@ -9,17 +10,19 @@ import (
 )
 
 const (
-	healthInterval     = 15 * time.Second
-	healthMaxFailures  = 3
-	keepaliveTimeout   = 10 * time.Second
+	healthInterval    = 20 * time.Second
+	healthMaxFailures = 3
+	probeTimeout      = 10 * time.Second
 )
 
-// MonitorHealth melakukan ping berkala ke server SSH menggunakan
-// protokol keepalive@openssh.com.
+// MonitorHealth membuka channel SSH baru ke DNS publik tiap interval.
 //
-// Jika SSH benar-benar mati gantung, ia akan mengirim sinyal true ke failChan.
-// Kegagalan ini TIDAK dipicu oleh gangguan internet keluar dari VPS,
-// hanya oleh SSH session itu sendiri.
+// Ini mengecek 3 hal sekaligus:
+//  1. SSH session masih hidup
+//  2. Channel subsystem masih bisa dibuka
+//  3. Jalur end-to-end (router → Cloudflare → VPS) masih tembus
+//
+// Kalau salah satu rusak (termasuk Cloudflare silent drop), probe gagal.
 func MonitorHealth(
 	ctx context.Context,
 	sshClient *gossh.Client,
@@ -35,57 +38,60 @@ func MonitorHealth(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			logger.Debug(
-				"[HEALTH] tick at %s failure=%d",
-				time.Now().Format(time.RFC3339),
-				failureCount,
-			)
-
 			if sshClient == nil {
 				return
 			}
 
-			done := make(chan error, 1)
-			go func() {
-				_, _, err := sshClient.SendRequest(
-					"keepalive@openssh.com",
-					true,
-					nil,
-				)
-				done <- err
-			}()
-
-			select {
-			case err := <-done:
-				if err == nil {
-					failureCount = 0
-					continue
+			err := probeSSH(ctx, sshClient)
+			if err == nil {
+				if failureCount > 0 {
+					logger.Info("[HEALTH] probe recovered")
 				}
-
-				failureCount++
-				logger.Warn(
-					"[HEALTH] keepalive failed (%d/%d): %v",
-					failureCount,
-					healthMaxFailures,
-					err,
-				)
-			case <-time.After(keepaliveTimeout):
-				failureCount++
-				logger.Warn(
-					"[HEALTH] keepalive timeout (%d/%d)",
-					failureCount,
-					healthMaxFailures,
-				)
+				failureCount = 0
+				continue
 			}
+
+			failureCount++
+			logger.Warn(
+				"[HEALTH] probe failed (%d/%d): %v",
+				failureCount,
+				healthMaxFailures,
+				err,
+			)
 
 			if failureCount >= healthMaxFailures {
 				logger.Errorf(
-					"[HEALTH] SSH keepalive failed %d times, connection considered dead",
+					"[HEALTH] koneksi dianggap mati setelah %d kegagalan berturut",
 					failureCount,
 				)
 				failChan <- true
 				return
 			}
 		}
+	}
+}
+
+// probeSSH buka channel SSH ke 1.1.1.1:53 lalu langsung tutup.
+//
+// Pakai port DNS karena ringan, hampir selalu terbuka, dan
+// tidak butuh handshake SSH tambahan.
+func probeSSH(ctx context.Context, client *gossh.Client) error {
+	done := make(chan error, 1)
+
+	go func() {
+		conn, err := client.Dial("tcp", "1.1.1.1:53")
+		if err == nil {
+			_ = conn.Close()
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(probeTimeout):
+		return errors.New("probe timeout")
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
