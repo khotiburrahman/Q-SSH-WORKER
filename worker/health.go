@@ -79,7 +79,7 @@ func probeSSH(ctx context.Context, client *gossh.Client) error {
 	done := make(chan error, 1)
 
 	go func() {
-		conn, err := client.Dial("tcp", "1.1.1.1:53")
+		conn, err := client.Dial("tcp", "1.1.1.1:443")
 		if err == nil {
 			_ = conn.Close()
 		}
